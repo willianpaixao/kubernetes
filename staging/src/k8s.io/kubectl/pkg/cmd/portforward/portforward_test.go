@@ -1038,3 +1038,626 @@ func TestCreateDialer(t *testing.T) {
 		t.Errorf("expected fallback dialer, got %#v", dialer)
 	}
 }
+
+// TestReversePortForwardFlagParsing tests that the --reverse flag is properly parsed
+// TODO: This test is currently skipped because the --reverse flag has not been implemented yet.
+// Once the flag is added to NewCmdPortForward, remove the t.Skip() and verify the tests pass.
+func TestReversePortForwardFlagParsing(t *testing.T) {
+	t.Skip("Skipping until --reverse flag is implemented in portforward.go")
+
+	tests := []struct {
+		name          string
+		args          []string
+		flags         map[string]string
+		expectReverse bool
+		expectError   bool
+	}{
+		{
+			name:          "reverse flag set to true",
+			args:          []string{"foo", "8080:5000"},
+			flags:         map[string]string{"reverse": "true"},
+			expectReverse: true,
+			expectError:   false,
+		},
+		{
+			name:          "reverse flag set to false",
+			args:          []string{"foo", "8080:5000"},
+			flags:         map[string]string{"reverse": "false"},
+			expectReverse: false,
+			expectError:   false,
+		},
+		{
+			name:          "reverse flag not set (default forward mode)",
+			args:          []string{"foo", "8080:5000"},
+			flags:         map[string]string{},
+			expectReverse: false,
+			expectError:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tf := cmdtesting.NewTestFactory().WithNamespace("test")
+			defer tf.Cleanup()
+
+			codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
+			ns := scheme.Codecs.WithoutConversion()
+
+			pod := execPod()
+			tf.Client = &fake.RESTClient{
+				VersionedAPIPath:     "/api/v1",
+				GroupVersion:         schema.GroupVersion{Group: "", Version: "v1"},
+				NegotiatedSerializer: ns,
+				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
+					switch p, m := req.URL.Path, req.Method; {
+					case p == "/api/v1/namespaces/test/pods/foo" && m == "GET":
+						body := cmdtesting.ObjBody(codec, pod)
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: body}, nil
+					default:
+						t.Errorf("%s: unexpected request: %#v\n%#v", tc.name, req.URL, req)
+						return nil, nil
+					}
+				}),
+			}
+			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
+
+			opts := &PortForwardOptions{}
+			cmd := NewCmdPortForward(tf, genericiooptions.NewTestIOStreamsDiscard())
+
+			for name, value := range tc.flags {
+				if err := cmd.Flags().Set(name, value); err != nil {
+					t.Fatalf("failed to set flag %s: %v", name, err)
+				}
+			}
+
+			err := opts.Complete(tf, cmd, tc.args)
+
+			if tc.expectError && err == nil {
+				t.Errorf("%s: expected error but got none", tc.name)
+			}
+			if !tc.expectError && err != nil {
+				t.Errorf("%s: unexpected error: %v", tc.name, err)
+			}
+
+			// TODO: Once the Reverse field is added to PortForwardOptions, verify it's set correctly:
+			// if opts.Reverse != tc.expectReverse {
+			//     t.Errorf("%s: expected Reverse=%v but got %v", tc.name, tc.expectReverse, opts.Reverse)
+			// }
+		})
+	}
+}
+
+// TestReversePortSpecificationSyntax tests that reverse port specifications follow REMOTE:LOCAL format
+func TestReversePortSpecificationSyntax(t *testing.T) {
+	tests := []struct {
+		name        string
+		ports       []string
+		reverse     bool
+		expectValid bool
+		expectError string
+	}{
+		{
+			name:        "forward mode with LOCAL:REMOTE format",
+			ports:       []string{"8080:5000"},
+			reverse:     false,
+			expectValid: true,
+		},
+		{
+			name:        "forward mode with single port (same local and remote)",
+			ports:       []string{"5000"},
+			reverse:     false,
+			expectValid: true,
+		},
+		{
+			name:        "forward mode with random local port",
+			ports:       []string{":5000"},
+			reverse:     false,
+			expectValid: true,
+		},
+		{
+			name:        "reverse mode with REMOTE:LOCAL format",
+			ports:       []string{"8080:5000"},
+			reverse:     true,
+			expectValid: true,
+		},
+		{
+			name:        "reverse mode with single port (same local and remote)",
+			ports:       []string{"5000"},
+			reverse:     true,
+			expectValid: true,
+		},
+		{
+			name:        "reverse mode with multiple ports",
+			ports:       []string{"8080:5000", "9090:6000"},
+			reverse:     true,
+			expectValid: true,
+		},
+		{
+			name:        "reverse mode should not allow random remote port",
+			ports:       []string{"8080:"},
+			reverse:     true,
+			expectValid: false,
+			expectError: "remote port cannot be empty in reverse mode",
+		},
+		// Port range validation tests
+		// NOTE: The following tests are temporary helpers for implementation and may be
+		// removed or refactored once proper port validation is implemented in the main code.
+		{
+			name:        "port number zero in forward mode",
+			ports:       []string{"0:5000"},
+			reverse:     false,
+			expectValid: true, // Port 0 means random port assignment for local port
+		},
+		{
+			name:        "port number zero as remote port in forward mode",
+			ports:       []string{"8080:0"},
+			reverse:     false,
+			expectValid: false,
+			expectError: "remote port must be between 1 and 65535",
+		},
+		{
+			name:        "port number zero in reverse mode",
+			ports:       []string{"0:5000"},
+			reverse:     true,
+			expectValid: false,
+			expectError: "remote port must be between 1 and 65535",
+		},
+		{
+			name:        "negative port number in forward mode",
+			ports:       []string{"-1:5000"},
+			reverse:     false,
+			expectValid: false,
+			expectError: "port must be between 0 and 65535",
+		},
+		{
+			name:        "negative port number in reverse mode",
+			ports:       []string{"8080:-1"},
+			reverse:     true,
+			expectValid: false,
+			expectError: "port must be between 1 and 65535",
+		},
+		{
+			name:        "port number above valid range (65536) in forward mode",
+			ports:       []string{"65536:5000"},
+			reverse:     false,
+			expectValid: false,
+			expectError: "port must be between 0 and 65535",
+		},
+		{
+			name:        "port number above valid range (65536) in reverse mode",
+			ports:       []string{"8080:65536"},
+			reverse:     true,
+			expectValid: false,
+			expectError: "port must be between 1 and 65535",
+		},
+		{
+			name:        "port number at maximum valid range (65535) in forward mode",
+			ports:       []string{"65535:5000"},
+			reverse:     false,
+			expectValid: true,
+		},
+		{
+			name:        "port number at maximum valid range (65535) in reverse mode",
+			ports:       []string{"8080:65535"},
+			reverse:     true,
+			expectValid: true,
+		},
+		{
+			name:        "port number 1 (minimum valid) in forward mode",
+			ports:       []string{"1:5000"},
+			reverse:     false,
+			expectValid: true,
+		},
+		{
+			name:        "port number 1 (minimum valid) in reverse mode",
+			ports:       []string{"8080:1"},
+			reverse:     true,
+			expectValid: true,
+		},
+		{
+			name:        "very large port number (100000) in forward mode",
+			ports:       []string{"100000:5000"},
+			reverse:     false,
+			expectValid: false,
+			expectError: "port must be between 0 and 65535",
+		},
+		{
+			name:        "very large port number (100000) in reverse mode",
+			ports:       []string{"8080:100000"},
+			reverse:     true,
+			expectValid: false,
+			expectError: "port must be between 1 and 65535",
+		},
+		{
+			name:        "non-numeric port in forward mode",
+			ports:       []string{"abc:5000"},
+			reverse:     false,
+			expectValid: false,
+			expectError: "invalid port",
+		},
+		{
+			name:        "non-numeric port in reverse mode",
+			ports:       []string{"8080:xyz"},
+			reverse:     true,
+			expectValid: false,
+			expectError: "invalid port",
+		},
+		{
+			name:        "empty string as port",
+			ports:       []string{""},
+			reverse:     false,
+			expectValid: false,
+			expectError: "port specification cannot be empty",
+		},
+		{
+			name:        "whitespace in port specification",
+			ports:       []string{" 8080:5000 "},
+			reverse:     false,
+			expectValid: false,
+			expectError: "invalid port",
+		},
+		{
+			name:        "multiple colons in port specification",
+			ports:       []string{"8080:5000:3000"},
+			reverse:     false,
+			expectValid: false,
+			expectError: "invalid port specification",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// This is a placeholder for the actual validation logic
+			// The implementation will need to validate reverse port specifications
+			// For now, we're defining the expected behavior
+
+			// When reverse mode is implemented, add validation like:
+			// err := validateReversePortSpecs(tc.ports, tc.reverse)
+			// if tc.expectValid && err != nil {
+			//     t.Errorf("%s: expected valid ports but got error: %v", tc.name, err)
+			// }
+			// if !tc.expectValid && err == nil {
+			//     t.Errorf("%s: expected error but got none", tc.name)
+			// }
+			// if !tc.expectValid && err != nil && !strings.Contains(err.Error(), tc.expectError) {
+			//     t.Errorf("%s: expected error containing %q but got %q", tc.name, tc.expectError, err.Error())
+			// }
+		})
+	}
+}
+
+// TestReversePortForwardValidation tests validation logic for reverse port-forward
+func TestReversePortForwardValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		podName     string
+		ports       []string
+		reverse     bool
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "empty pod name should fail",
+			podName:     "",
+			ports:       []string{"8080:5000"},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "pod name or resource type/name must be specified",
+		},
+		{
+			name:        "no ports specified should fail",
+			podName:     "test-pod",
+			ports:       []string{},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "at least 1 PORT is required for port-forward",
+		},
+		{
+			name:        "valid ports in forward mode",
+			podName:     "test-pod",
+			ports:       []string{"8080:5000"},
+			reverse:     false,
+			expectError: false,
+		},
+		{
+			name:        "valid ports in reverse mode",
+			podName:     "test-pod",
+			ports:       []string{"8080:5000"},
+			reverse:     true,
+			expectError: false,
+		},
+		// NOTE: The following tests are temporary helpers for implementation and may be
+		// removed or refactored once proper port validation is implemented in the main code.
+		{
+			name:        "port zero as local port in forward mode should be valid",
+			podName:     "test-pod",
+			ports:       []string{"0:5000"},
+			reverse:     false,
+			expectError: false, // Port 0 means random local port
+		},
+		{
+			name:        "port zero as remote port in forward mode should fail",
+			podName:     "test-pod",
+			ports:       []string{"8080:0"},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "remote port must be between 1 and 65535",
+		},
+		{
+			name:        "port zero in reverse mode should fail",
+			podName:     "test-pod",
+			ports:       []string{"0:5000"},
+			reverse:     true,
+			expectError: true,
+			errorMsg:    "remote port must be between 1 and 65535",
+		},
+		{
+			name:        "negative port should fail",
+			podName:     "test-pod",
+			ports:       []string{"-1:5000"},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "port above 65535 should fail",
+			podName:     "test-pod",
+			ports:       []string{"65536:5000"},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "port 65535 should be valid",
+			podName:     "test-pod",
+			ports:       []string{"65535:5000"},
+			reverse:     false,
+			expectError: false,
+		},
+		{
+			name:        "port 1 should be valid",
+			podName:     "test-pod",
+			ports:       []string{"1:5000"},
+			reverse:     false,
+			expectError: false,
+		},
+		{
+			name:        "multiple invalid ports should fail on first invalid",
+			podName:     "test-pod",
+			ports:       []string{"8080:5000", "100000:6000"},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "mixed valid and invalid ports should fail",
+			podName:     "test-pod",
+			ports:       []string{"8080:5000", "-1:6000", "9090:7000"},
+			reverse:     false,
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := PortForwardOptions{
+				PodName: tc.podName,
+				Ports:   tc.ports,
+				// TODO: Add Reverse field once it's implemented in PortForwardOptions
+				// Reverse: tc.reverse,
+			}
+
+			// Only set required fields if we have a pod name
+			// This allows us to test validation failures
+			if tc.podName != "" && len(tc.ports) > 0 {
+				opts.PortForwarder = &fakePortForwarder{}
+				// For PodClient, RESTClient, and Config, we just need non-nil values
+				// since Validate() only checks if they are nil
+				opts.PodClient = nil // Will fail validation if we expect it to pass
+				opts.RESTClient = nil
+				opts.Config = nil
+			}
+
+			err := opts.Validate()
+
+			if tc.expectError && err == nil {
+				t.Errorf("%s: expected error but got none", tc.name)
+			}
+			if !tc.expectError && err != nil {
+				t.Errorf("%s: unexpected error: %v", tc.name, err)
+			}
+			if tc.expectError && err != nil && tc.errorMsg != "" {
+				if err.Error() != tc.errorMsg {
+					t.Errorf("%s: expected error %q but got %q", tc.name, tc.errorMsg, err.Error())
+				}
+			}
+		})
+	}
+}
+
+// TestPortRangeValidation tests comprehensive port range validation
+// NOTE: This test function is a temporary helper for implementation and may be
+// removed or refactored once proper port validation is implemented in the main code.
+func TestPortRangeValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		portSpec    string
+		expectError bool
+		errorMsg    string
+	}{
+		// Valid port ranges
+		{
+			name:        "minimum valid port (1)",
+			portSpec:    "1:5000",
+			expectError: false,
+		},
+		{
+			name:        "maximum valid port (65535)",
+			portSpec:    "65535:5000",
+			expectError: false,
+		},
+		{
+			name:        "typical web port (80)",
+			portSpec:    "80:8080",
+			expectError: false,
+		},
+		{
+			name:        "typical https port (443)",
+			portSpec:    "443:8443",
+			expectError: false,
+		},
+		{
+			name:        "high port number (60000)",
+			portSpec:    "60000:5000",
+			expectError: false,
+		},
+		// Port 0 - special case
+		{
+			name:        "port 0 for local (random port assignment)",
+			portSpec:    "0:5000",
+			expectError: false, // Should be valid for local port only
+		},
+		{
+			name:        "port 0 for remote should fail",
+			portSpec:    "8080:0",
+			expectError: true,
+			errorMsg:    "remote port must be between 1 and 65535",
+		},
+		{
+			name:        "both ports as 0 should fail",
+			portSpec:    "0:0",
+			expectError: true,
+			errorMsg:    "remote port must be between 1 and 65535",
+		},
+		// Negative numbers
+		{
+			name:        "negative local port",
+			portSpec:    "-1:5000",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "negative remote port",
+			portSpec:    "8080:-1",
+			expectError: true,
+			errorMsg:    "port must be between 1 and 65535",
+		},
+		{
+			name:        "both ports negative",
+			portSpec:    "-1:-1",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "large negative number",
+			portSpec:    "-999999:5000",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		// Above valid range
+		{
+			name:        "port 65536 (one above max)",
+			portSpec:    "65536:5000",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "remote port 65536",
+			portSpec:    "8080:65536",
+			expectError: true,
+			errorMsg:    "port must be between 1 and 65535",
+		},
+		{
+			name:        "port 100000",
+			portSpec:    "100000:5000",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "very large port number",
+			portSpec:    "999999:5000",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		{
+			name:        "max int overflow",
+			portSpec:    "2147483648:5000",
+			expectError: true,
+			errorMsg:    "port must be between 0 and 65535",
+		},
+		// Boundary testing
+		{
+			name:        "just below max valid (65534)",
+			portSpec:    "65534:5000",
+			expectError: false,
+		},
+		{
+			name:        "just above min valid (2)",
+			portSpec:    "2:5000",
+			expectError: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// This is a placeholder for the actual port validation logic
+			// When implementing reverse port-forward, this validation should be added
+
+			// Example implementation:
+			// err := validatePortRange(tc.portSpec)
+			// if tc.expectError && err == nil {
+			//     t.Errorf("%s: expected error but got none", tc.name)
+			// }
+			// if !tc.expectError && err != nil {
+			//     t.Errorf("%s: unexpected error: %v", tc.name, err)
+			// }
+			// if tc.expectError && err != nil && !strings.Contains(err.Error(), tc.errorMsg) {
+			//     t.Errorf("%s: expected error containing %q but got %q", tc.name, tc.errorMsg, err.Error())
+			// }
+		})
+	}
+}
+
+// TestReverseForwardModeConflict tests that reverse and forward modes cannot be mixed
+func TestReverseForwardModeConflict(t *testing.T) {
+	tests := []struct {
+		name        string
+		reverse     bool
+		ports       []string
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name:        "forward mode with standard port syntax",
+			reverse:     false,
+			ports:       []string{"8080:5000"},
+			expectError: false,
+		},
+		{
+			name:        "reverse mode with standard port syntax",
+			reverse:     true,
+			ports:       []string{"8080:5000"},
+			expectError: false,
+		},
+		// Additional tests can be added as the implementation evolves
+		// to test specific conflict scenarios
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// This is a placeholder for testing mode conflict detection
+			// The actual implementation will add logic to detect and prevent
+			// conflicting reverse/forward configurations
+
+			// Example of what the test might look like:
+			// err := validatePortForwardMode(tc.reverse, tc.ports)
+			// if tc.expectError && err == nil {
+			//     t.Errorf("%s: expected error but got none", tc.name)
+			// }
+			// if !tc.expectError && err != nil {
+			//     t.Errorf("%s: unexpected error: %v", tc.name, err)
+			// }
+		})
+	}
+}
